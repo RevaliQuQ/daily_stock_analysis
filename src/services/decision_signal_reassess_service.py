@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Preview-only decision-profile reassessment from persisted analysis history."""
+"""Decision-profile reassessment from persisted analysis history."""
 
 from __future__ import annotations
 
@@ -7,7 +7,9 @@ import re
 from collections.abc import Mapping
 from typing import Any, Optional
 
-from src.schemas.decision_action import build_action_fields
+from src.schemas.decision_action import build_action_fields, normalize_decision_action
+from src.schemas.decision_profile import normalize_decision_profile
+from src.schemas.decision_scale import action_for_score, score_action_conflicts_without_guardrail
 from src.services.decision_profile_policy import (
     PROFILE_POLICY_VERSION,
     SCORING_VERSION,
@@ -16,15 +18,10 @@ from src.services.decision_profile_policy import (
     apply_decision_profile_policy,
 )
 from src.services.decision_signal_data_quality import normalize_decision_signal_data_quality
+from src.services.decision_signal_service import DecisionSignalService
 from src.storage import AnalysisHistory, DatabaseManager
 from src.utils.data_processing import parse_json_field
 from src.utils.sniper_points import find_sniper_points, parse_sniper_value
-
-
-UNSUPPORTED_PERSIST_MESSAGE = (
-    "Persisting reassessed decision_profile signals requires decision_profile "
-    "to be promoted to a first-class field."
-)
 
 
 class DecisionSignalSourceReportNotFoundError(Exception):
@@ -39,15 +36,25 @@ class DecisionSignalUnsupportedReportSnapshotError(Exception):
     """Raised when the persisted report snapshot is insufficient for reassess."""
 
 
-class DecisionSignalReassessUnsupportedOperationError(Exception):
-    """Raised when the request asks for a future reassess operation."""
+class DecisionSignalReassessGuardrailBlockedError(Exception):
+    """Raised when persist recomputation has no safe signal to store."""
+
+    def __init__(self, *, blocked_reason: str, warnings: list[dict[str, object]]) -> None:
+        self.blocked_reason = blocked_reason
+        self.warnings = warnings
+        super().__init__(blocked_reason)
 
 
 class DecisionSignalReassessService:
-    """Build preview-only reassess responses without touching DecisionSignal rows."""
+    """Recompute a profile signal and optionally persist the authoritative result."""
 
-    def __init__(self, db: Optional[DatabaseManager] = None) -> None:
+    def __init__(
+        self,
+        db: Optional[DatabaseManager] = None,
+        signal_service: Optional[DecisionSignalService] = None,
+    ) -> None:
         self.db = db or DatabaseManager.get_instance()
+        self.signal_service = signal_service or DecisionSignalService(db_manager=self.db)
 
     def reassess(
         self,
@@ -56,8 +63,9 @@ class DecisionSignalReassessService:
         decision_profile: str,
         persist: bool = False,
     ) -> dict[str, Any]:
-        if persist:
-            raise DecisionSignalReassessUnsupportedOperationError(UNSUPPORTED_PERSIST_MESSAGE)
+        decision_profile_norm = normalize_decision_profile(decision_profile)
+        if decision_profile_norm is None:
+            raise ValueError("decision_profile is required")
 
         record = self.db.get_analysis_history_by_id(source_report_id)
         if record is None:
@@ -76,12 +84,12 @@ class DecisionSignalReassessService:
         )
         policy = apply_decision_profile_policy(
             candidate,
-            decision_profile=decision_profile,
+            decision_profile=decision_profile_norm,
             data_quality_level=data_quality_level,
         )
         preview_candidate = policy.candidate
         metadata = {
-            "decision_profile": decision_profile,
+            "decision_profile": decision_profile_norm,
             "profile_source": "user_selected",
             "profile_policy_version": PROFILE_POLICY_VERSION,
             "signal_generation_version": SIGNAL_GENERATION_VERSION,
@@ -90,7 +98,7 @@ class DecisionSignalReassessService:
             "data_quality_level": data_quality_level,
             "guardrail_result": policy.guardrail_result.as_dict(),
         }
-        preview = {
+        preview: dict[str, Any] = {
             "action": preview_candidate.action,
             "score": preview_candidate.score,
             "confidence": preview_candidate.confidence,
@@ -105,13 +113,89 @@ class DecisionSignalReassessService:
             "watch_conditions": preview_candidate.watch_conditions,
             "metadata": metadata,
         }
+        if not persist:
+            return {
+                "preview": preview,
+                "item": None,
+                "created": False,
+                "persist_status": None,
+                "warnings": policy.warnings,
+                "blocked_reason": policy.blocked_reason,
+            }
+
+        if not policy.guardrail_result.passed:
+            raise DecisionSignalReassessGuardrailBlockedError(
+                blocked_reason=policy.blocked_reason or "actionable_signal_blocked_by_guardrail",
+                warnings=policy.warnings,
+            )
+
+        payload = _build_persist_payload(
+            record,
+            raw_result=raw_result,
+            decision_profile=decision_profile_norm,
+            candidate=preview_candidate,
+            metadata=metadata,
+        )
+        market_phase_summary = _as_mapping(context_snapshot.get("market_phase_summary"))
+        if not market_phase_summary:
+            market_phase_summary = _as_mapping(raw_result.get("market_phase_summary"))
+        try:
+            outcome = self.signal_service.create_history_bound_signal_with_outcome(
+                payload,
+                history_created_at=getattr(record, "created_at", None),
+                market_phase_summary=market_phase_summary,
+            )
+        except ValueError as exc:
+            raise DecisionSignalUnsupportedReportSnapshotError(
+                f"source report snapshot cannot produce a valid decision signal: {exc}"
+            ) from exc
         return {
-            "preview": preview,
-            "item": None,
-            "created": False,
+            "preview": None,
+            "item": outcome.item,
+            "created": outcome.created,
+            "persist_status": outcome.disposition,
             "warnings": policy.warnings,
-            "blocked_reason": policy.blocked_reason,
+            "blocked_reason": None,
         }
+
+
+def _build_persist_payload(
+    record: AnalysisHistory,
+    *,
+    raw_result: Mapping[str, Any],
+    decision_profile: str,
+    candidate: DecisionSignalCandidate,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    stock_code = str(getattr(record, "code", "") or "").strip()
+    market = _infer_market(stock_code)
+    if not stock_code or market is None:
+        raise DecisionSignalUnsupportedReportSnapshotError("source report has no supported stock identity")
+    return {
+        "stock_code": stock_code,
+        "stock_name": getattr(record, "name", None),
+        "market": market,
+        "source_type": "analysis",
+        "source_report_id": int(getattr(record, "id")),
+        "source_agent": "decision_profile_reassess",
+        "trigger_source": "web:decision_profile_reassess",
+        "decision_profile": decision_profile,
+        "market_phase": candidate.market_phase,
+        "action": candidate.action,
+        "score": candidate.score,
+        "confidence": candidate.confidence,
+        "horizon": candidate.horizon,
+        "entry_low": candidate.entry_low,
+        "entry_high": candidate.entry_high,
+        "stop_loss": candidate.stop_loss,
+        "target_price": candidate.target_price,
+        "invalidation": candidate.invalidation,
+        "reason": candidate.reason,
+        "risk_summary": candidate.risk_summary,
+        "watch_conditions": candidate.watch_conditions,
+        "metadata": metadata,
+        "report_language": raw_result.get("report_language"),
+    }
 
 
 def _build_candidate(
@@ -128,6 +212,15 @@ def _build_candidate(
     if not raw_code or not market:
         raise DecisionSignalUnsupportedReportSnapshotError("source report has no supported stock identity")
 
+    dashboard = _as_mapping(raw_result.get("dashboard"))
+    score = _effective_signal_score(
+        _score_from_value(_first_present(raw_result.get("sentiment_score"), getattr(record, "sentiment_score", None))),
+        dashboard=dashboard,
+    )
+    raw_action = normalize_decision_action(raw_result.get("action")) or normalize_decision_action(
+        _first_present(raw_result.get("operation_advice"), getattr(record, "operation_advice", None))
+    )
+    guardrail_reason = _extract_guardrail_reason(raw_result, score=score, raw_action=raw_action)
     action_fields = build_action_fields(
         operation_advice=_first_present(
             raw_result.get("operation_advice"),
@@ -136,6 +229,9 @@ def _build_candidate(
         explicit_action=raw_result.get("action"),
         report_type=report_type,
         report_language=raw_result.get("report_language"),
+        sentiment_score=score,
+        guardrail_reason=guardrail_reason,
+        align_with_score=True,
     )
     action = action_fields.get("action")
     if not action:
@@ -149,7 +245,7 @@ def _build_candidate(
     market_phase = _extract_market_phase(raw_result, context_snapshot)
     return DecisionSignalCandidate(
         action=action,
-        score=_score_from_value(_first_present(raw_result.get("sentiment_score"), getattr(record, "sentiment_score", None))),
+        score=score,
         confidence=_confidence_from_level(raw_result.get("confidence_level")),
         horizon=_extract_horizon(raw_result, context_snapshot, market_phase, action),
         entry_low=entry_low,
@@ -167,6 +263,10 @@ def _build_candidate(
         watch_conditions=_extract_watch_conditions(raw_result),
         market_phase=market_phase,
     )
+
+
+def _as_mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def _parse_mapping(value: Any) -> Mapping[str, Any]:
@@ -232,6 +332,76 @@ def _score_from_value(value: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return score if 0 <= score <= 100 else None
+
+
+def _effective_signal_score(
+    score: Optional[int],
+    *,
+    dashboard: Mapping[str, Any],
+) -> Optional[int]:
+    calibration = _as_mapping(dashboard.get("decision_score_calibration"))
+    adjusted = _score_from_value(calibration.get("adjusted_score"))
+    return adjusted if adjusted is not None else score
+
+
+def _extract_guardrail_reason(
+    raw_result: Mapping[str, Any],
+    *,
+    score: Optional[int],
+    raw_action: Optional[str],
+) -> Optional[str]:
+    dashboard = raw_result.get("dashboard") if isinstance(raw_result.get("dashboard"), Mapping) else {}
+    calibration = (
+        dashboard.get("decision_score_calibration")
+        if isinstance(dashboard.get("decision_score_calibration"), Mapping)
+        else {}
+    )
+    stability = (
+        dashboard.get("decision_stability")
+        if isinstance(dashboard.get("decision_stability"), Mapping)
+        else {}
+    )
+    for candidate in (
+        calibration.get("guardrail_reason"),
+        stability.get("reason"),
+        raw_result.get("guardrail_reason"),
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    if score_action_conflicts_without_guardrail(score=score, action=raw_action):
+        candidates = [raw_result.get("operation_advice")]
+        if action_for_score(score) == "buy":
+            candidates.extend(
+                [
+                    raw_result.get("analysis_summary"),
+                    raw_result.get("buy_reason"),
+                    raw_result.get("risk_warning"),
+                ]
+            )
+        hints = (
+            "等待",
+            "待",
+            "需要确认",
+            "缺少确认",
+            "未确认",
+            "回踩",
+            "支撑",
+            "压力",
+            "风险",
+            "资金",
+            "突破",
+            "不追",
+            "不宜",
+        )
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if not text:
+                continue
+            normalized = text.lower()
+            if any(hint in normalized for hint in hints):
+                return text
+    return None
 
 
 def _confidence_from_level(value: Any) -> Optional[float]:
